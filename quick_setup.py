@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-quick_setup.py — YAML-driven environment bootstrapper (apt + pip)
+quick_setup.py — YAML-driven environment bootstrapper (apt + pip + scripts)
 
 Usage:
   python3 scripts/quick_setup/quick_setup.py --config /path/to/env.yaml [--dry-run]
@@ -25,8 +25,14 @@ pip:                      # list or mapping
     - PyYAML>=6.0
     - requests
 
+scripts:                  # optional, list of strings or mappings
+  - echo "hello"          # string -> executed via bash -lc in config dir
+  - cmd: ["python3", "tools/setup.py", "--flag"]  # list -> executed directly
+    cwd: tools            # optional working dir (relative to config)
+    env: { FOO: BAR }     # optional env overrides
+
 Notes:
-- Only apt and pip are considered at present.
+- Supports apt, pip, and custom scripts.
 - Idempotency is delegated to apt/pip; safe to re-run.
 """
 
@@ -190,8 +196,81 @@ def handle_pip(pip_cfg: Any, dry_run: bool) -> None:
     print("✅ pip packages installed.")
 
 
+def _as_cwd(path: Optional[str], base_dir: str) -> str:
+    if not path:
+        return base_dir
+    if os.path.isabs(path):
+        return path
+    return os.path.abspath(os.path.join(base_dir, path))
+
+
+def handle_scripts(scripts_cfg: Any, dry_run: bool, base_dir: str) -> None:
+    """Execute custom script commands.
+
+    Supported forms:
+    - list of strings: each executed via bash -lc in base_dir
+    - list of mappings: { cmd: <str|[args...]>, cwd?: <str>, env?: {K:V} }
+    """
+    if not scripts_cfg:
+        return
+
+    items: List[Any]
+    if isinstance(scripts_cfg, list):
+        items = scripts_cfg
+    else:
+        raise ValueError("scripts must be a list of strings or mappings")
+
+    for i, item in enumerate(items, 1):
+        if isinstance(item, str):
+            cmd = ["bash", "-lc", item]
+            cwd = base_dir
+            env = os.environ.copy()
+        elif isinstance(item, dict):
+            cmd_val = item.get("cmd")
+            if isinstance(cmd_val, list):
+                cmd = [str(x) for x in cmd_val]
+            elif isinstance(cmd_val, str):
+                cmd = ["bash", "-lc", cmd_val]
+            else:
+                raise ValueError("scripts item mapping requires 'cmd' as str or list")
+            cwd = _as_cwd(item.get("cwd"), base_dir)
+            env = os.environ.copy()
+            env_cfg = item.get("env") or {}
+            if isinstance(env_cfg, dict):
+                env.update({str(k): str(v) for k, v in env_cfg.items()})
+        else:
+            raise ValueError("scripts items must be strings or mappings")
+
+        print(f"-- script[{i}] cwd={cwd}")
+        printable = " ".join(cmd)
+        print(f"$ {printable}")
+        if not dry_run:
+            rc = subprocess.call(cmd, cwd=cwd, env=env)  # noqa: S603
+            if rc != 0:
+                raise SystemExit(rc)
+
+
+def _extract_groups(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Return a mapping of group_name -> group_cfg.
+
+    Supports:
+    - New style: { groups: { base: {...}, rust: {...}, mooncake: {...} } }
+    - Flat named groups at top level: { base: {...}, rust: {...} }
+    - Legacy flat config: { apt: ..., pip: ... } as single group 'default'
+    """
+    if isinstance(cfg.get("groups"), dict):
+        groups = cfg["groups"]
+        return {str(k): (v or {}) for k, v in groups.items()}
+
+    known = [k for k in ("base", "rust", "mooncake") if isinstance(cfg.get(k), dict)]
+    if known:
+        return {k: cfg[k] for k in known}
+
+    return {"default": cfg}
+
+
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="YAML-standardized environment setup (apt + pip)")
+    parser = argparse.ArgumentParser(description="YAML-standardized environment setup (apt + pip) — installs all groups")
     parser.add_argument("--config", required=True, help="Path to env YAML config")
     parser.add_argument("--dry-run", action="store_true", help="Print actions without executing")
     args = parser.parse_args(argv)
@@ -205,21 +284,39 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception:
             print("⚠️  'version' should be an integer.")
 
-    if "apt" in cfg:
-        print("\n==> Installing apt packages")
-        handle_apt(cfg.get("apt"), dry_run=args.dry_run)
-    else:
-        print("\n==> No 'apt' section present; skipping apt.")
+    groups = _extract_groups(cfg)
 
-    if "pip" in cfg:
-        print("\n==> Installing pip packages")
-        handle_pip(cfg.get("pip"), dry_run=args.dry_run)
-    else:
-        print("\n==> No 'pip' section present; skipping pip.")
+    # Always install all groups in YAML order
+    for name, gcfg in groups.items():
+
+        print(f"\n==> Group [{name}]")
+        if "apt" in gcfg:
+            print("-- apt")
+            handle_apt(gcfg.get("apt"), dry_run=args.dry_run)
+        if "pip" in gcfg:
+            print("-- pip")
+            handle_pip(gcfg.get("pip"), dry_run=args.dry_run)
+
+        if "scripts" in gcfg:
+            print("-- scripts")
+            config_dir = os.path.dirname(os.path.abspath(args.config))
+            handle_scripts(gcfg.get("scripts"), dry_run=args.dry_run, base_dir=config_dir)
+
+        # Legacy single group fields
+        if "apt" not in gcfg and name == "default" and "apt" in cfg:
+            print("-- apt")
+            handle_apt(cfg.get("apt"), dry_run=args.dry_run)
+        if "pip" not in gcfg and name == "default" and "pip" in cfg:
+            print("-- pip")
+            handle_pip(cfg.get("pip"), dry_run=args.dry_run)
+
+        if "scripts" not in gcfg and name == "default" and "scripts" in cfg:
+            print("-- scripts")
+            config_dir = os.path.dirname(os.path.abspath(args.config))
+            handle_scripts(cfg.get("scripts"), dry_run=args.dry_run, base_dir=config_dir)
 
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
