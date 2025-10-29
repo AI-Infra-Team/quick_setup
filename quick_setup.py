@@ -142,9 +142,9 @@ def handle_apt(apt_cfg: Any, dry_run: bool) -> None:
     print("✅ apt packages installed.")
 
 
-def handle_pip(pip_cfg: Any, dry_run: bool) -> None:
+def handle_pip(pip_cfg: Any, dry_run: bool, base_dir: Optional[str] = None) -> None:
     # Normalize config
-    packages: List[str] = []
+    packages: List[Any] = []
     upgrade = True
     user_install = False
     index_url: Optional[str] = None
@@ -152,9 +152,9 @@ def handle_pip(pip_cfg: Any, dry_run: bool) -> None:
     requirements: List[str] = []
 
     if isinstance(pip_cfg, list):
-        packages = [str(x) for x in pip_cfg]
+        packages = [x for x in pip_cfg]
     elif isinstance(pip_cfg, dict):
-        packages = [str(x) for x in pip_cfg.get("packages", [])]
+        packages = [x for x in pip_cfg.get("packages", [])]
         upgrade = bool(pip_cfg.get("upgrade", True))
         user_install = bool(pip_cfg.get("user", False))
         index_url = pip_cfg.get("index_url")
@@ -186,7 +186,53 @@ def handle_pip(pip_cfg: Any, dry_run: bool) -> None:
         cmd.extend(["--index-url", index_url])
     for url in extra_index_urls:
         cmd.extend(["--extra-index-url", url])
-    cmd.extend(packages)
+    # Resolve special package mappings (e.g., { pyproject: "./" }) relative to YAML dir
+    resolved_packages: List[str] = []
+    for item in packages:
+        if isinstance(item, dict) and "pyproject" in item:
+            rel = item.get("pyproject")
+            if rel is None:
+                raise ValueError("pip packages item 'pyproject' requires a path")
+            rel_str = str(rel)
+            # Determine absolute path relative to base_dir (YAML location)
+            abs_path = os.path.abspath(os.path.join(base_dir or os.getcwd(), rel_str)) if not os.path.isabs(rel_str) else rel_str
+            # Accept directory, or setup.py / pyproject.toml file and convert to its directory
+            if os.path.isdir(abs_path):
+                project_path = abs_path
+            elif os.path.isfile(abs_path) and os.path.basename(abs_path) in ("setup.py", "pyproject.toml"):
+                project_path = os.path.dirname(abs_path)
+            else:
+                raise FileNotFoundError(f"pyproject path not found or invalid: {abs_path}")
+            # Optional: allow forcing editable install, only if explicitly requested
+            force_editable = bool(item.get("editable", False))
+            if force_editable:
+                resolved_packages.extend(["-e", project_path])
+            else:
+                # If an old root-owned build/ exists and isn't writable, try to clean it up
+                build_dir = os.path.join(project_path, "build")
+                try:
+                    if os.path.isdir(build_dir) and not os.access(build_dir, os.W_OK):
+                        print(f"⚠️  Detected non-writable build dir: {build_dir} — attempting cleanup via sudo")
+                        rc = run_cmd([*sudo_prefix(), "rm", "-rf", build_dir], dry_run=dry_run)
+                        if rc != 0:
+                            print("⚠️  Cleanup failed; pip install may fail if build dir remains read-only.")
+                    # Also clean non-writable egg-info dirs at project root
+                    for name in os.listdir(project_path):
+                        if name.endswith('.egg-info'):
+                            egg_dir = os.path.join(project_path, name)
+                            if os.path.isdir(egg_dir) and not os.access(egg_dir, os.W_OK):
+                                print(f"⚠️  Detected non-writable egg-info: {egg_dir} — attempting cleanup via sudo")
+                                rc = run_cmd([*sudo_prefix(), "rm", "-rf", egg_dir], dry_run=dry_run)
+                                if rc != 0:
+                                    print("⚠️  Cleanup failed; pip install may fail if egg-info remains read-only.")
+                except Exception:
+                    # Non-critical; proceed and let pip report if it fails
+                    pass
+                resolved_packages.append(project_path)
+        else:
+            resolved_packages.append(str(item))
+
+    cmd.extend(resolved_packages)
     for req in requirements:
         cmd.extend(["-r", req])
 
@@ -295,7 +341,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             handle_apt(gcfg.get("apt"), dry_run=args.dry_run)
         if "pip" in gcfg:
             print("-- pip")
-            handle_pip(gcfg.get("pip"), dry_run=args.dry_run)
+            config_dir = os.path.dirname(os.path.abspath(args.config))
+            handle_pip(gcfg.get("pip"), dry_run=args.dry_run, base_dir=config_dir)
 
         if "scripts" in gcfg:
             print("-- scripts")
@@ -308,7 +355,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             handle_apt(cfg.get("apt"), dry_run=args.dry_run)
         if "pip" not in gcfg and name == "default" and "pip" in cfg:
             print("-- pip")
-            handle_pip(cfg.get("pip"), dry_run=args.dry_run)
+            config_dir = os.path.dirname(os.path.abspath(args.config))
+            handle_pip(cfg.get("pip"), dry_run=args.dry_run, base_dir=config_dir)
 
         if "scripts" not in gcfg and name == "default" and "scripts" in cfg:
             print("-- scripts")
