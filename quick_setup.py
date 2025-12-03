@@ -308,7 +308,7 @@ def _extract_groups(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         groups = cfg["groups"]
         return {str(k): (v or {}) for k, v in groups.items()}
 
-    known = [k for k in ("base", "rust", "mooncake") if isinstance(cfg.get(k), dict)]
+    known = [k for k in ("base", "rust", "mooncake", "spdk") if isinstance(cfg.get(k), dict)]
     if known:
         return {k: cfg[k] for k in known}
 
