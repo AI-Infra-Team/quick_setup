@@ -82,13 +82,27 @@ def sudo_prefix() -> List[str]:
     return []
 
 
-def run_cmd(cmd: List[str], env: Optional[Dict[str, str]] = None, dry_run: bool = False) -> int:
+def run_cmd(
+    cmd: List[str],
+    env: Optional[Dict[str, str]] = None,
+    dry_run: bool = False,
+    *,
+    cwd: Optional[str] = None,
+) -> int:
+    """Run a command with optional env and working directory.
+
+    Note: quick_setup expects relative paths (like "." or requirements files)
+    to resolve against the directory of the target YAML. Therefore, callers
+    that depend on such paths must pass the YAML directory via `cwd`.
+    """
     printable = " ".join(cmd)
+    if cwd:
+        print(f"(cwd: {cwd})")
     print(f"$ {printable}")
     if dry_run:
         return 0
     try:
-        return subprocess.call(cmd, env=env)  # noqa: S603
+        return subprocess.call(cmd, env=env, cwd=cwd)  # noqa: S603
     except FileNotFoundError:
         return 127
 
@@ -142,7 +156,7 @@ def handle_apt(apt_cfg: Any, dry_run: bool) -> None:
     print("✅ apt packages installed.")
 
 
-def handle_pip(pip_cfg: Any, dry_run: bool) -> None:
+def handle_pip(pip_cfg: Any, dry_run: bool, *, base_dir: str) -> None:
     # Normalize config
     packages: List[str] = []
     upgrade = True
@@ -190,7 +204,10 @@ def handle_pip(pip_cfg: Any, dry_run: bool) -> None:
     for req in requirements:
         cmd.extend(["-r", req])
 
-    rc = run_cmd(cmd, dry_run=dry_run)
+    # Run pip relative to the YAML directory so that entries like
+    #   - .[dev]
+    # and requirements files resolve correctly.
+    rc = run_cmd(cmd, dry_run=dry_run, cwd=base_dir)
     if rc != 0:
         raise SystemExit(rc)
     print("✅ pip packages installed.")
@@ -290,16 +307,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     for name, gcfg in groups.items():
 
         print(f"\n==> Group [{name}]")
+        # All relative paths (requirements files, local editable package ".")
+        # should resolve against the YAML location
+        config_dir = os.path.dirname(os.path.abspath(args.config))
         if "apt" in gcfg:
             print("-- apt")
             handle_apt(gcfg.get("apt"), dry_run=args.dry_run)
         if "pip" in gcfg:
             print("-- pip")
-            handle_pip(gcfg.get("pip"), dry_run=args.dry_run)
+            handle_pip(gcfg.get("pip"), dry_run=args.dry_run, base_dir=config_dir)
 
         if "scripts" in gcfg:
             print("-- scripts")
-            config_dir = os.path.dirname(os.path.abspath(args.config))
             handle_scripts(gcfg.get("scripts"), dry_run=args.dry_run, base_dir=config_dir)
 
         # Legacy single group fields
@@ -308,7 +327,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             handle_apt(cfg.get("apt"), dry_run=args.dry_run)
         if "pip" not in gcfg and name == "default" and "pip" in cfg:
             print("-- pip")
-            handle_pip(cfg.get("pip"), dry_run=args.dry_run)
+            handle_pip(cfg.get("pip"), dry_run=args.dry_run, base_dir=config_dir)
 
         if "scripts" not in gcfg and name == "default" and "scripts" in cfg:
             print("-- scripts")
