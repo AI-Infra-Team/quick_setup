@@ -74,12 +74,13 @@ def is_root() -> bool:
 
 
 def sudo_prefix() -> List[str]:
+    """Unified sudo policy: use 'sudo -E' when not root.
+
+    Keep behavior simple to avoid divergence across scripts.
+    """
     if is_root():
         return []
-    if shutil.which("sudo"):
-        return ["sudo"]
-    # No sudo available; attempts to apt-get will likely fail without root
-    return []
+    return ["sudo", "-E"]
 
 
 def run_cmd(
